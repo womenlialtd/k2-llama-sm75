@@ -142,27 +142,42 @@ jobs:
             'cccl/windows-x86_64/cccl-windows-x86_64-13.3.4.2.1-archive.zip'
           )
 
-          $work = Join-Path $env:RUNNER_TEMP 'cuda-dl'
+          $work  = Join-Path $env:RUNNER_TEMP 'cuda-dl'
+          $xdir  = Join-Path $env:RUNNER_TEMP 'cuda-x'
           New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+          # 每个 redist 归档内部恰好只有一层 <组件>-windows-x86_64-<版本>-archive 目录，
+          # 逐个下载 -> 解压到临时目录 -> 把该层内容合并进 CUDA_HOME。
+          # 不硬编码内层目录名，避免版本串变化导致路径对不上。
           foreach ($c in $components) {
             $name = [IO.Path]::GetFileName($c)
             $file = Join-Path $work $name
             Write-Host "downloading $name"
             curl.exe -sSL --fail --retry 3 -o "$file" "$env:CUDA_REDIST_BASE/$c"
             if ($LASTEXITCODE -ne 0) { throw "download failed: $c" }
-            Expand-Archive -Path $file -DestinationPath (Join-Path $dst $name) -Force
+
+            if (Test-Path $xdir) { Remove-Item $xdir -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $xdir | Out-Null
+            Expand-Archive -Path $file -DestinationPath $xdir -Force
+
+            $inner = @(Get-ChildItem -Path $xdir -Directory)
+            if ($inner.Count -lt 1) { throw "unexpected archive layout (no top dir): $name" }
+            $src = $inner[0].FullName
+            Write-Host "  merging $src -> $dst"
+            # robocopy 语义明确（会合并已存在的同名子目录）；退出码 0-7 均为成功。
+            # 不用 Copy-Item -Recurse：目标子目录已存在时会嵌套成 bin\bin。
+            robocopy "$src" "$dst" /E /COPY:DAT /DCOPY:T /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Host
+            if ($LASTEXITCODE -gt 7) { throw "robocopy failed (exit $LASTEXITCODE) merging $name" }
+            $global:LASTEXITCODE = 0
           }
 
-          # 每个归档内层是一级同名目录，摊平到 CUDA_HOME（等价上游的 xcopy /E /I /H /Y）
-          foreach ($c in $components) {
-            $name = [IO.Path]::GetFileName($c) -replace '\.zip$',''
-            $src  = Join-Path $dst $name
-            Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
-            Remove-Item -Path $src -Recurse -Force -ErrorAction SilentlyContinue
-          }
+          Write-Host "=== CUDA_HOME top level ==="
+          Get-ChildItem $dst | Select-Object -ExpandProperty Name
 
           if (-not (Test-Path (Join-Path $dst 'bin\nvcc.exe'))) { throw "nvcc.exe not found under $dst\bin" }
+          foreach ($must in @('include\cuda_runtime.h','lib\x64\cudart.lib','nvvm\bin\nvvm64.dll')) {
+            if (-not (Test-Path (Join-Path $dst $must))) { Write-Host "::warning::missing $must" }
+          }
 
           $dst + '\bin'     | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $dst + '\libnvvp' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
