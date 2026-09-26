@@ -1,0 +1,375 @@
+name: K2-Horizon Windows CUDA 13.4 Build
+
+# =============================================================================
+# K2-Horizon llama.cpp — Windows x64 + CUDA 13.4 (MSVC) 主程序包
+#
+# 实际安装的工具链版本：CUDA 13.4.1 GA（NVIDIA 未发布 13.4.0）
+# 产物包名按需求固定：K2-Horizon-llama-35999d1-bin-win-cuda13.4-x64.zip
+#
+# 设计要点
+#  1. 只挂 workflow_dispatch，不挂 push / pull_request，避免误触发。
+#  2. 源码锁定 commit 35999d1（分支 model/K2Horizon），不追踪上游。
+#  3. 该 commit 自带的 .github/actions/windows-setup-cuda 中，13.4 只有
+#     ARM64 分支、没有 x64（x64 最高到 13.3）。所以这里把 x64 安装步骤内联，
+#     10 个 redist 归档 URL 逐条照抄上游 master 的 'Install Cuda Toolkit 13.4
+#     for x64'，并已验证全部 HTTP 200 可下载。
+#  4. 构建参数对齐上游 release.yml 的 windows-cpu + windows-cuda 两个 job
+#     （GGML_BACKEND_DL=ON + GGML_CPU_ALL_VARIANTS=ON），因此单 job 即可产出
+#     完整的 exe + ggml-cuda.dll，不需要上游那套「CPU job 出 exe、CUDA job 出
+#     dll、再 Merge」的流程。
+#     注：上游此时期用 -DLLAMA_BUILD_BORINGSSL=ON，但该选项在 35999d1 中不
+#     存在（更晚引入），故这里改用 LLAMA_OPENSSL=OFF，效果同样是"不依赖外部
+#     OpenSSL DLL"，与官方 zip 里没有 libssl/libcrypto 一致。
+#  5. 只交付主程序包：ZIP 内不含 cudart/cublas 等 CUDA 运行时 DLL（官方也是
+#     单独打成 cudart-llama-bin-win-cuda-13.4-x64.zip，你本机已装 13.4 可直接用）。
+#  6. 防覆盖上锁：if github.repository == 'womenlialtd/llama.cpp'
+# =============================================================================
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  COMMIT_SHA: 35999d101cf2233fc54f09c3c8d599da7303ce02
+  SHORT_HASH: 35999d1
+  CUDA_VERSION: '13.4'
+  CUDA_REDIST_BASE: https://developer.download.nvidia.com/compute/cuda/redist
+  CUDA_HOME_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
+  ZIP_NAME: K2-Horizon-llama-35999d1-bin-win-cuda13.4-x64.zip
+  PATCH_URL: https://raw.githubusercontent.com/Manus-Vindicte/IssuesFixes/main/llama.cpp/k2horizon-windows-unicode/k2horizon-windows-unicode-fix.patch
+  CCACHE_VER: 4.10.2
+  CCACHE_DIR: ${{ github.workspace }}\.ccache
+  CCACHE_MAXSIZE: 500M
+
+jobs:
+  build:
+    # 防覆盖上锁：只在本 Fork 中运行；上游同步或他人 fork 会直接跳过
+    if: github.repository == 'womenlialtd/llama.cpp'
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout fixed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+          fetch-depth: 1
+
+      # -----------------------------------------------------------------------
+      # 补丁 k2horizon-windows-unicode-fix.patch
+      # 作用：MSVC 的 narrow-ECMAScript 正则不接受 \uHHHH 转义（error_escape），
+      #       导致 K2 Horizon 模板中 \u200C / \u200D 的 pattern 永远加载失败。
+      #       补丁把 \uHHHH 重写为文本折叠后同一码点所对应的字节，跨平台一致。
+      # 范围：单文件 src/unicode.cpp，2 处 hunk。
+      # 校验：补丁 index 要求 blob 93996f9，与 35999d1 的 src/unicode.cpp 完全
+      #       一致（git hash-object = 93996f9dd542ed2b2e671de51ed98c243d65dabe），
+      #       本地 git apply --check 已通过。
+      # -----------------------------------------------------------------------
+      - name: Apply K2-Horizon Windows Unicode patch
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $patchFile = Join-Path $env:RUNNER_TEMP "k2horizon-windows-unicode-fix.patch"
+
+          # 主路径：raw.githubusercontent.com
+          try {
+            Invoke-WebRequest -Uri $env:PATCH_URL -OutFile $patchFile -TimeoutSec 120
+          } catch {
+            Write-Host "::warning::raw URL failed: $($_.Exception.Message)"
+          }
+
+          # 兜底：raw 不可达时改用 GitHub contents API 取同一文件
+          $needFallback = $true
+          if (Test-Path $patchFile) {
+            if ((Get-Item $patchFile).Length -ge 1000) { $needFallback = $false }
+          }
+          if ($needFallback) {
+            $api = $env:PATCH_URL -replace '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$',
+                                            'https://api.github.com/repos/$1/$2/contents/$4?ref=$3'
+            Write-Host "fallback -> $api"
+            $hdr = @{ Accept = 'application/vnd.github.raw+json' }
+            if ($env:GITHUB_TOKEN) { $hdr['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
+            Invoke-WebRequest -Uri $api -Headers $hdr -OutFile $patchFile -TimeoutSec 120
+          }
+
+          $size = (Get-Item $patchFile).Length
+          Write-Host "patch size: $size bytes"
+          if ($size -lt 1000) { throw "patch looks truncated ($size bytes)" }
+
+          git apply --check --verbose $patchFile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::patch does not apply cleanly to $env:COMMIT_SHA"
+            Get-Content $patchFile | Select-Object -First 40
+            exit 1
+          }
+          git apply --verbose $patchFile
+          git diff --stat
+          git diff --numstat | ForEach-Object { Write-Host "patched: $_" }
+
+      # -----------------------------------------------------------------------
+      # MSVC（windows-2022 自带 VS2022）
+      # -----------------------------------------------------------------------
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # -----------------------------------------------------------------------
+      # CUDA Toolkit 13.4（13.4.1 GA）x64 — NVIDIA redist 归档免安装部署
+      # 组件与版本串严格照抄上游 master 的同名步骤
+      # -----------------------------------------------------------------------
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }} (x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dst = $env:CUDA_HOME_DIR
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          $components = @(
+            'cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.4.59-archive.zip',
+            'cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.4.49-archive.zip',
+            'cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.4.59-archive.zip',
+            'cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.4.59-archive.zip',
+            'libcublas/windows-x86_64/libcublas-windows-x86_64-13.7.0.27-archive.zip',
+            'libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.4.59-archive.zip',
+            'cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.4.49-archive.zip',
+            'cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.4.49-archive.zip',
+            'visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.4.49-archive.zip',
+            'cccl/windows-x86_64/cccl-windows-x86_64-13.3.4.2.1-archive.zip'
+          )
+
+          $work = Join-Path $env:RUNNER_TEMP 'cuda-dl'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          foreach ($c in $components) {
+            $name = [IO.Path]::GetFileName($c)
+            $file = Join-Path $work $name
+            Write-Host "downloading $name"
+            curl.exe -sSL --fail --retry 3 -o "$file" "$env:CUDA_REDIST_BASE/$c"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $c" }
+            Expand-Archive -Path $file -DestinationPath (Join-Path $dst $name) -Force
+          }
+
+          # 每个归档内层是一级同名目录，摊平到 CUDA_HOME（等价上游的 xcopy /E /I /H /Y）
+          foreach ($c in $components) {
+            $name = [IO.Path]::GetFileName($c) -replace '\.zip$',''
+            $src  = Join-Path $dst $name
+            Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+            Remove-Item -Path $src -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Test-Path (Join-Path $dst 'bin\nvcc.exe'))) { throw "nvcc.exe not found under $dst\bin" }
+
+          $dst + '\bin'     | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $dst + '\libnvvp' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$dst"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CUDA_PATH_V13_4=$dst" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ccache and Ninja
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # ccache：官方 GitHub Release 取 win64，版本可复现
+          $zip = "ccache-$env:CCACHE_VER-windows-x86_64.zip"
+          $url = "https://github.com/ccache/ccache/releases/download/v$env:CCACHE_VER/$zip"
+          New-Item -ItemType Directory -Force -Path 'C:\ccache' | Out-Null
+          curl.exe -sSL --fail --retry 3 -o "$env:RUNNER_TEMP\$zip" "$url"
+          if ($LASTEXITCODE -ne 0) { throw "ccache download failed: $url" }
+          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath 'C:\ccache\raw' -Force
+          $exe = Get-ChildItem -Path 'C:\ccache\raw' -Recurse -Filter ccache.exe | Select-Object -First 1
+          if (-not $exe) { throw "ccache.exe not found after extraction" }
+          Copy-Item $exe.FullName 'C:\ccache\ccache.exe' -Force
+          'C:\ccache' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Ninja
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja --no-progress -y }
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          nvcc --version
+          cmake --version | Select-Object -First 1
+          ninja --version
+          ccache --version
+          cl 2>&1 | Select-Object -First 1
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+
+      # -----------------------------------------------------------------------
+      # ccache 缓存：key 用 github.sha（按需求），restore-keys 兜底命中历史缓存
+      # -----------------------------------------------------------------------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: k2-horizon-win-cuda-${{ github.sha }}
+          restore-keys: |
+            k2-horizon-win-cuda-
+
+      - name: Configure ccache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CCACHE_DIR | Out-Null
+          ccache --set-config=max_size=$env:CCACHE_MAXSIZE
+          ccache --set-config=cache_dir=$env:CCACHE_DIR
+          ccache --set-config=compression=true
+          ccache -z
+          ccache -s
+
+      # -----------------------------------------------------------------------
+      # 配置：CUDA arch 显式只编 75（GTX 1660 / Turing）
+      # 上游默认集是 75/80/86/89/90 + 120a/121a，要编 7 套 kernel；
+      # 只编 75 能砍掉大半 nvcc 时间。代价：这份产物只能跑 Turing 卡。
+      # -----------------------------------------------------------------------
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_RPC=ON `
+            -DGGML_OPENMP=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES=75 `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_UI=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $jobs = [Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS - 1)
+          Write-Host "building with $jobs parallel jobs"
+          cmake --build build --config Release -j $jobs
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Show ccache stats
+        shell: pwsh
+        run: ccache -s
+
+      # -----------------------------------------------------------------------
+      # 打包：Ninja Multi-Config 产物在 build\bin\Release\
+      # 按需求排除 CUDA 运行时 DLL
+      # -----------------------------------------------------------------------
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bin = Join-Path $env:GITHUB_WORKSPACE "build\bin\Release"
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::build output dir not found: $bin"
+            Get-ChildItem -Recurse -Directory -Path build\bin -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "Build output not found"
+          }
+
+          Write-Host "=== raw build output ==="
+          Get-ChildItem -Path $bin -File | Select-Object Name, Length | Format-Table -AutoSize | Out-String -Width 200
+
+          # 必需产物缺失就直接失败，别打包出跑不起来的东西
+          foreach ($req in @('llama-cli.exe','llama-server.exe','ggml-cuda.dll','ggml.dll')) {
+            if (-not (Test-Path (Join-Path $bin $req))) { throw "required artifact missing: $req" }
+          }
+
+          # 排除 CUDA / cuDNN 运行时：cudart* cublas* cublasLt* cufft* curand*
+          #                      nvrtc* nvJitLink* npp* npps* cudnn* cuinj*
+          $exclude = '^(cudart|cublas|cublasLt|cufft|curand|nvrtc|nvJitLink|npp|npps|cudnn|cuinj)'
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE ("dist\" + ($env:ZIP_NAME -replace '\.zip$',''))
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $kept = @(Get-ChildItem -Path $bin -File | Where-Object {
+            $_.Extension -in '.exe', '.dll' -and $_.Name -notmatch $exclude
+          })
+          $kept | Copy-Item -Destination $stage -Force
+          Write-Host "staged $($kept.Count) files"
+
+          $skipped = @(Get-ChildItem -Path $bin -File | Where-Object { $_.Extension -eq '.dll' -and $_.Name -match $exclude })
+          if ($skipped.Count -gt 0) { Write-Host "excluded CUDA runtime DLLs: $($skipped.Name -join ', ')" }
+
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE $env:ZIP_NAME
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+
+          $mb = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+          Write-Host "=== final ZIP: $env:ZIP_NAME ($mb MB) ==="
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize | Out-String -Width 200
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+          ### K2-Horizon Windows CUDA 13.4
+          - commit: ``35999d1`` / toolchain: CUDA ``13.4.1`` GA (redist)
+          - patch: k2horizon-windows-unicode-fix (src/unicode.cpp)
+          - CUDA arch: ``75`` only (Turing / GTX 1660)
+          - package: $env:ZIP_NAME ($mb MB, $($kept.Count) files)
+          - CUDA runtime DLLs intentionally excluded
+          "@
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------------
+      # 自动创建 / 更新 Release 并上传 ZIP
+      # 用 runner 自带 gh CLI，避免引入第三方 action；重跑时 --clobber 覆盖
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          TAG="k2-horizon-llama-${SHORT_HASH}"
+          TITLE="K2-Horizon llama.cpp ${SHORT_HASH} Windows CUDA 13.4 x64"
+          cat > /tmp/release-notes.md <<'EOF'
+          ## K2-Horizon llama.cpp 35999d1 — Windows x64 + CUDA 13.4
+
+          | 项 | 值 |
+          |---|---|
+          | 源码 | `35999d101cf2233fc54f09c3c8d599da7303ce02`（分支 `model/K2Horizon`）|
+          | 补丁 | `k2horizon-windows-unicode-fix.patch` — 修 MSVC 正则不接受 `\uHHHH`，导致 K2 模板中 `\u200C`/`\u200D` pattern 加载失败 |
+          | 编译器 | MSVC (VS2022, windows-2022 runner) |
+          | CUDA | Toolkit **13.4.1 GA**，以 NVIDIA redist 归档免安装方式部署（包名按需求记作 `cuda13.4`）|
+          | CUDA 架构 | **仅 sm_75**（Turing / GTX 1660）—— 非通用包，其它卡无法使用 CUDA 后端 |
+          | 运行环境 | Windows 10/11 x64 |
+
+          ### 包内容
+          `llama-cli.exe`、`llama-server.exe`、`llama-bench.exe`、`llama-quantize.exe`、
+          `llama-perplexity.exe`、`llama-imatrix.exe`、`llama-fit-params.exe`、`llama-tts.exe`、
+          `llama-mtmd-cli.exe` 等，加 `ggml.dll`、`ggml-cuda.dll`、`ggml-cpu-*.dll`、
+          `llama.dll`、`llama-common.dll`、`mtmd.dll`、`ggml-rpc*` 等核心库。
+
+          ### ⚠️ 本包不含 CUDA 运行时 DLL
+          按需求，`cudart64_*.dll` / `cublas64_*.dll` / `cublasLt64_*.dll` 未打包。
+          - 本机已装 CUDA 13.4 → 解压即用。
+          - 本机无 CUDA Toolkit → 需另装 CUDA 运行时，或参照上游的
+            `cudart-llama-bin-win-cuda-13.4-x64.zip`，把这些 DLL 放到 exe 同目录。
+
+          ### GTX 1660 6 GB 提示
+          7B 模型建议 Q3/Q4 量化，并压低 `-c/--ctx-size` 与 KV 缓存
+          （如 `-ctk f16 -ctv f16` 或 `q8_0`），否则容易 OOM。
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists -> uploading asset with --clobber"
+            gh release upload "$TAG" "$ZIP_NAME" --clobber
+          else
+            gh release create "$TAG" "$ZIP_NAME" \
+              --title "$TITLE" \
+              --notes-file /tmp/release-notes.md \
+              --latest=false
+          fi
+          gh release view "$TAG" --json tagName,assets,url --jq '{tag:.tagName,url:.url,assets:[.assets[].name]}'
