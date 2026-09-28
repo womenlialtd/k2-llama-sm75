@@ -15,10 +15,11 @@
 | `master`（默认分支） | 上游代码 + 我自己加的 1 个 CI workflow 文件，**没有改动 llama.cpp 的任何 C++ 源码** |
 | `model/K2Horizon` | 含 K2-Horizon 模型支持的分支，构建固定在这里的 commit `35999d1` |
 
-对上游的改动，全部加起来就一个文件（`ahead_by=4` 是提交数，不是文件数）：
+对上游的改动，全部加起来就 **2 个文件**（都不碰 C++ 源码）：
 
 ```
-.github/workflows/k2-horizon-win-cuda.yml   +393 行
+.github/workflows/k2-horizon-win-cuda.yml   构建 workflow，约 +393 行
+README.md                                   就是本说明（覆盖了 fork 继承来的上游 README）
 ```
 
 也就是说：**这个仓库的实际产出都在 Releases 里，不在源码里。**
