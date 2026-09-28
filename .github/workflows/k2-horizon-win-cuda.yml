@@ -46,7 +46,9 @@ env:
 jobs:
   build:
     # 防覆盖上锁：只在本 Fork 中运行；上游同步或他人 fork 会直接跳过
-    if: github.repository == 'womenlialtd/llama.cpp'
+    # 防覆盖上锁：只允许本账号的仓库跑这个 workflow（避免 fork 传播后互抢 Windows 分钟数）。
+    # 用 repository_owner 而非 repository 全名 —— 仓库改名时不会静默把 job 变成 skipped。
+    if: github.repository_owner == 'womenlialtd'
     runs-on: windows-2022
     timeout-minutes: 360
 
