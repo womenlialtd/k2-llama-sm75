@@ -22,7 +22,8 @@ name: K2-Horizon Windows CUDA 13.4 Build
 #     OpenSSL DLL"，与官方 zip 里没有 libssl/libcrypto 一致。
 #  5. 只交付主程序包：ZIP 内不含 cudart/cublas 等 CUDA 运行时 DLL（官方也是
 #     单独打成 cudart-llama-bin-win-cuda-13.4-x64.zip，你本机已装 13.4 可直接用）。
-#  6. 防覆盖上锁：if github.repository == 'womenlialtd/llama.cpp'
+#  6. 防覆盖上锁：if github.repository_owner == 'womenlialtd'
+#     （用 owner 而非仓库全名，这样仓库改名后 job 不会静默变 skipped）
 # =============================================================================
 
 on:
